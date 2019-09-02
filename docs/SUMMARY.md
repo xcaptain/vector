@@ -83,6 +83,7 @@
     * [kafka sink][docs.kafka_sink]
     * [prometheus sink][docs.prometheus_sink]
     * [splunk_hec sink][docs.splunk_hec_sink]
+    * [statsd sink](docs.statsd_sink)
     * [tcp sink][docs.tcp_sink]
     * [vector sink][docs.vector_sink]
   * [Specification](usage/configuration/specification.md)
@@ -135,6 +136,7 @@
 [docs.remove_fields_transform]: ./usage/configuration/transforms/remove_fields.md
 [docs.sampler_transform]: ./usage/configuration/transforms/sampler.md
 [docs.splunk_hec_sink]: ./usage/configuration/sinks/splunk_hec.md
+[docs.statsd_sink]: ./usage/configuration/sinks/statsd.md
 [docs.statsd_source]: ./usage/configuration/sources/statsd.md
 [docs.stdin_source]: ./usage/configuration/sources/stdin.md
 [docs.syslog_source]: ./usage/configuration/sources/syslog.md
