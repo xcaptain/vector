@@ -1,10 +1,12 @@
 use approx::assert_relative_eq;
 use futures::{Future, Sink, Stream};
+use std::iter;
 use std::{collections::HashMap, thread, time::Duration};
 use tokio::codec::{FramedWrite, LinesCodec};
 use tokio_uds::UnixStream;
 use vector::test_util::{
-    block_on, next_addr, random_lines, receive, send_lines, shutdown_on_idle, wait_for_tcp,
+    block_on, next_addr, random_lines, random_maps, receive, send_lines, shutdown_on_idle,
+    wait_for_tcp,
 };
 use vector::topology::{self, config};
 use vector::{
@@ -20,7 +22,10 @@ fn test_tcp_syslog() {
     let out_addr = next_addr();
 
     let mut config = config::Config::empty();
-    config.add_source("in", SyslogConfig::new(Mode::Tcp { address: in_addr }));
+    config.add_source(
+        "in",
+        SyslogConfig::new(Mode::Tcp { address: in_addr }, false),
+    );
     config.add_sink(
         "out",
         &["in"],
@@ -35,11 +40,7 @@ fn test_tcp_syslog() {
     // Wait for server to accept traffic
     wait_for_tcp(in_addr);
 
-    let input_lines = random_lines(100)
-        .enumerate()
-        .map(|(id, line)| generate_rfc5424_log_line(id, line))
-        .take(num_lines)
-        .collect::<Vec<_>>();
+    let input_lines: Vec<String> = random_rfc5424_lines(100, 4, 4).take(num_lines).collect();
 
     block_on(send_lines(in_addr, input_lines.clone().into_iter())).unwrap();
 
@@ -60,7 +61,10 @@ fn test_udp_syslog() {
     let out_addr = next_addr();
 
     let mut config = config::Config::empty();
-    config.add_source("in", SyslogConfig::new(Mode::Udp { address: in_addr }));
+    config.add_source(
+        "in",
+        SyslogConfig::new(Mode::Udp { address: in_addr }, false),
+    );
     config.add_sink(
         "out",
         &["in"],
@@ -73,11 +77,7 @@ fn test_udp_syslog() {
 
     let (topology, _crash) = topology::start(config, &mut rt, false).unwrap();
 
-    let input_lines = random_lines(100)
-        .enumerate()
-        .map(|(id, line)| generate_rfc5424_log_line(id, line))
-        .take(num_lines)
-        .collect::<Vec<_>>();
+    let input_lines: Vec<String> = random_rfc5424_lines(100, 4, 4).take(num_lines).collect();
 
     let bind_addr = next_addr();
     let socket = std::net::UdpSocket::bind(&bind_addr).unwrap();
@@ -114,9 +114,12 @@ fn test_unix_stream_syslog() {
     let mut config = config::Config::empty();
     config.add_source(
         "in",
-        SyslogConfig::new(Mode::Unix {
-            path: in_path.clone(),
-        }),
+        SyslogConfig::new(
+            Mode::Unix {
+                path: in_path.clone(),
+            },
+            false,
+        ),
     );
     config.add_sink(
         "out",
@@ -132,12 +135,7 @@ fn test_unix_stream_syslog() {
     // Wait for server to accept traffic
     while let Err(_) = std::os::unix::net::UnixStream::connect(&in_path) {}
 
-    let input_lines = random_lines(100)
-        .enumerate()
-        .map(|(id, line)| generate_rfc5424_log_line(id, line))
-        .take(num_lines)
-        .collect::<Vec<_>>();
-
+    let input_lines: Vec<String> = random_rfc5424_lines(100, 4, 4).take(num_lines).collect();
     let input_stream = futures::stream::iter_ok::<_, ()>(input_lines.clone().into_iter());
 
     UnixStream::connect(&in_path)
@@ -168,13 +166,38 @@ fn test_unix_stream_syslog() {
     assert_eq!(input_lines, output_lines);
 }
 
-fn generate_rfc5424_log_line(msg_id: usize, msg: String) -> String {
+fn random_rfc5424_lines(
+    msg_len: usize,
+    maps_amount: usize,
+    field_len: usize,
+) -> impl Iterator<Item = String> {
+    random_lines(msg_len)
+        .zip(random_structured_data(maps_amount, field_len))
+        .enumerate()
+        .map(|(id, (msg, data))| format_rfc5424_log_line(id, msg, data))
+}
+
+fn random_structured_data(
+    map_size: usize,
+    field_len: usize,
+) -> impl Iterator<Item = StructuredData> {
+    let sizes = iter::repeat(vec![0, 1, 2, 3]).flatten();
+
+    sizes.map(move |n| {
+        random_maps(map_size, field_len)
+            .take(n)
+            .enumerate()
+            .map(|(i, map)| (format!("{}", i), map))
+            .collect::<StructuredData>()
+    })
+}
+
+fn format_rfc5424_log_line(msg_id: usize, msg: String, data: StructuredData) -> String {
     let severity = Severity::LOG_INFO;
     let facility = Facility::LOG_USER;
     let hostname = "hogwarts";
     let process = "harry";
     let pid = 42;
-    let data = StructuredData::new();
 
     format!(
         "<{}>{} {} {} {} {} {} {} {}",

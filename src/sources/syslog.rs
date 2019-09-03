@@ -9,6 +9,7 @@ use derive_is_enum_variant::is_enum_variant;
 use futures::{future, sync::mpsc, Future, Sink, Stream};
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, path::PathBuf};
+use syslog_rfc5424::{self, message::ProcId::*, SyslogMessage};
 use tokio::{
     self,
     codec::{BytesCodec, FramedRead, LinesCodec},
@@ -27,6 +28,7 @@ pub struct SyslogConfig {
     #[serde(default = "default_max_length")]
     pub max_length: usize,
     pub host_key: Option<String>,
+    pub emit_structured: bool,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, is_enum_variant)]
@@ -42,11 +44,12 @@ fn default_max_length() -> usize {
 }
 
 impl SyslogConfig {
-    pub fn new(mode: Mode) -> Self {
+    pub fn new(mode: Mode, emit_structured: bool) -> Self {
         Self {
             mode,
             host_key: None,
             max_length: default_max_length(),
+            emit_structured,
         }
     }
 }
@@ -66,12 +69,25 @@ impl SourceConfig for SyslogConfig {
                 let source = SyslogTcpSource {
                     max_length: self.max_length,
                     host_key,
+                    emit_structured: self.emit_structured,
                 };
                 let shutdown_secs = 30;
                 source.run(address, shutdown_secs, out)
             }
-            Mode::Udp { address } => Ok(udp(address, self.max_length, host_key, out)),
-            Mode::Unix { path } => Ok(unix(path, self.max_length, host_key, out)),
+            Mode::Udp { address } => Ok(udp(
+                address,
+                self.max_length,
+                host_key,
+                self.emit_structured,
+                out,
+            )),
+            Mode::Unix { path } => Ok(unix(
+                path,
+                self.max_length,
+                host_key,
+                self.emit_structured,
+                out,
+            )),
         }
     }
 
@@ -84,6 +100,7 @@ impl SourceConfig for SyslogConfig {
 struct SyslogTcpSource {
     max_length: usize,
     host_key: String,
+    emit_structured: bool,
 }
 
 impl TcpSource for SyslogTcpSource {
@@ -94,7 +111,7 @@ impl TcpSource for SyslogTcpSource {
     }
 
     fn build_event(&self, frame: String, host: Option<Bytes>) -> Option<Event> {
-        event_from_str(&self.host_key, host, frame).map(|event| {
+        event_from_str(&self.host_key, host, frame, self.emit_structured).map(|event| {
             trace!(
                 message = "Received one event.",
                 event = field::debug(&event)
@@ -109,6 +126,7 @@ pub fn udp(
     addr: SocketAddr,
     _max_length: usize,
     host_key: String,
+    emit_structured: bool,
     out: mpsc::Sender<Event>,
 ) -> super::Source {
     let out = out.sink_map_err(|e| error!("error sending line: {:?}", e));
@@ -131,7 +149,7 @@ pub fn udp(
             let lines_in = UdpFramed::new(socket, BytesCodec::new())
                 .filter_map(move |(bytes, addr)| {
                     let host_key = host_key.clone();
-                    event_from_bytes(&host_key, &bytes).map(|mut e| {
+                    event_from_bytes(&host_key, emit_structured, &bytes).map(|mut e| {
                         e.as_mut_log()
                             .insert_implicit(host_key.into(), addr.to_string().into());
                         e
@@ -148,6 +166,7 @@ pub fn unix(
     path: PathBuf,
     max_length: usize,
     host_key: String,
+    emit_structured: bool,
     out: mpsc::Sender<Event>,
 ) -> super::Source {
     let out = out.sink_map_err(|e| error!("error sending line: {:?}", e));
@@ -179,7 +198,9 @@ pub fn unix(
 
                 let host_key2 = host_key.clone();
                 let lines_in = FramedRead::new(socket, LinesCodec::new_with_max_length(max_length))
-                    .filter_map(move |event| event_from_str(&host_key.clone(), None, event))
+                    .filter_map(move |event| {
+                        event_from_str(&host_key.clone(), None, event, emit_structured)
+                    })
                     .map(move |mut e| {
                         if let Some(path) = &path {
                             e.as_mut_log().insert_implicit(
@@ -198,10 +219,10 @@ pub fn unix(
     }))
 }
 
-fn event_from_bytes(host_key: &String, bytes: &[u8]) -> Option<Event> {
+fn event_from_bytes(host_key: &String, emit_structured: bool, bytes: &[u8]) -> Option<Event> {
     std::str::from_utf8(bytes)
         .ok()
-        .and_then(|s| event_from_str(host_key, None, s))
+        .and_then(|s| event_from_str(host_key, None, s, emit_structured))
 }
 
 // TODO: many more cases to handle:
@@ -210,7 +231,12 @@ fn event_from_bytes(host_key: &String, bytes: &[u8]) -> Option<Event> {
 // octet framing (i.e. num bytes as ascii string prefix) with and without delimiters
 // null byte delimiter in place of newline
 
-fn event_from_str(host_key: &String, host: Option<Bytes>, raw: impl AsRef<str>) -> Option<Event> {
+fn event_from_str(
+    host_key: &String,
+    host: Option<Bytes>,
+    raw: impl AsRef<str>,
+    emit_structured: bool,
+) -> Option<Event> {
     let line = raw.as_ref();
     trace!(
         message = "Received line.",
@@ -220,7 +246,11 @@ fn event_from_str(host_key: &String, host: Option<Bytes>, raw: impl AsRef<str>) 
     let line = line.trim();
     syslog_rfc5424::parse_message(line)
         .map(|parsed| {
-            let mut event = Event::from(line);
+            let mut event = if emit_structured {
+                Event::from(&parsed.msg[..])
+            } else {
+                Event::from(line)
+            };
 
             if let Some(host) = &parsed.hostname {
                 event
@@ -240,6 +270,10 @@ fn event_from_str(host_key: &String, host: Option<Bytes>, raw: impl AsRef<str>) 
                 .as_mut_log()
                 .insert_implicit(event::TIMESTAMP.clone(), timestamp.into());
 
+            if emit_structured {
+                insert_fields_from_rfc5424(&mut event, parsed);
+            }
+
             trace!(
                 message = "processing one event.",
                 event = &field::debug(&event)
@@ -249,6 +283,35 @@ fn event_from_str(host_key: &String, host: Option<Bytes>, raw: impl AsRef<str>) 
         })
         .map_err(|_| warn!("Problem parsing incoming message, check syslog format"))
         .ok()
+}
+
+fn insert_fields_from_rfc5424(event: &mut Event, parsed: SyslogMessage) {
+    let log = event.as_mut_log();
+
+    log.insert_implicit("severity".into(), parsed.severity.as_str().into());
+    log.insert_implicit("facility".into(), parsed.facility.as_str().into());
+    log.insert_implicit("version".into(), parsed.version.into());
+
+    if let Some(app_name) = parsed.appname {
+        log.insert_implicit("appname".into(), app_name.into());
+    }
+    if let Some(msg_id) = parsed.msgid {
+        log.insert_implicit("msgid".into(), msg_id.into());
+    }
+    if let Some(proc_id) = parsed.procid {
+        let value = match proc_id {
+            PID(pid) => pid.into(),
+            Name(name) => name.into(),
+        };
+        log.insert_implicit("procid".into(), value);
+    }
+
+    for (id, data) in parsed.sd.iter() {
+        for (name, value) in data.iter() {
+            let key = format!("{}.{}", id, name);
+            log.insert_implicit(key.into(), value.clone().into());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -263,6 +326,7 @@ mod test {
             r#"
             mode = "tcp"
             address = "127.0.0.1:1235"
+            emit_structured = true
           "#,
         )
         .unwrap();
@@ -273,6 +337,7 @@ mod test {
             mode = "udp"
             address = "127.0.0.1:1235"
             max_length = 32187
+            emit_structured = false
           "#,
         )
         .unwrap();
@@ -282,6 +347,7 @@ mod test {
             r#"
             mode = "unix"
             path = "127.0.0.1:1235"
+            emit_structured = false
           "#,
         )
         .unwrap();
@@ -303,8 +369,47 @@ mod test {
             .insert_implicit("host".into(), "74794bfb6795".into());
 
         assert_eq!(
-            expected,
-            event_from_str(&"host".to_string(), None, raw).unwrap()
+            event_from_str(&"host".to_string(), None, raw, false).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn syslog_ng_network_syslog_protocol_structured() {
+        // this should also match rsyslog omfwd with template=RSYSLOG_SyslogProtocol23Format
+        let msg = "i am foobar";
+        let raw = format!(
+            r#"<13>1 2019-02-13T19:48:34+00:00 74794bfb6795 root 8449 - {}{} {}"#,
+            r#"[meta1 seqId="1" someKey="someValue"]"#,
+            r#"[meta2 seqId="2" anotherKey="anotherValue"]"#,
+            msg
+        );
+
+        let mut expected = Event::from(msg);
+
+        {
+            let expected = expected.as_mut_log();
+            expected.insert_implicit(
+                event::TIMESTAMP.clone(),
+                chrono::Utc.ymd(2019, 2, 13).and_hms(19, 48, 34).into(),
+            );
+            expected.insert_implicit("host".into(), "74794bfb6795".into());
+
+            expected.insert_implicit("meta1.seqId".into(), "1".into());
+            expected.insert_implicit("meta2.seqId".into(), "2".into());
+            expected.insert_implicit("meta1.someKey".into(), "someValue".into());
+            expected.insert_implicit("meta2.anotherKey".into(), "anotherValue".into());
+
+            expected.insert_implicit("severity".into(), "notice".into());
+            expected.insert_implicit("facility".into(), "user".into());
+            expected.insert_implicit("version".into(), 1.into());
+            expected.insert_implicit("appname".into(), "root".into());
+            expected.insert_implicit("procid".into(), 8449.into());
+        }
+
+        assert_eq!(
+            event_from_str(&"host".to_string(), None, raw, true).unwrap(),
+            expected
         );
     }
 
@@ -326,8 +431,8 @@ mod test {
             .insert_implicit("host".into(), "74794bfb6795".into());
 
         assert_eq!(
-            expected,
-            event_from_str(&"host".to_string(), None, raw).unwrap()
+            event_from_str(&"host".to_string(), None, raw, false).unwrap(),
+            expected
         );
     }
 
@@ -346,8 +451,8 @@ mod test {
             .insert_implicit("host".into(), "74794bfb6795".into());
 
         assert_eq!(
-            expected,
-            event_from_str(&"host".to_string(), None, raw).unwrap()
+            event_from_str(&"host".to_string(), None, raw, false).unwrap(),
+            expected
         );
     }
 
@@ -366,8 +471,8 @@ mod test {
             .insert_implicit("host".into(), "74794bfb6795".into());
 
         assert_eq!(
-            expected,
-            event_from_str(&"host".to_string(), None, raw).unwrap()
+            event_from_str(&"host".to_string(), None, raw, false).unwrap(),
+            expected
         );
     }
 
@@ -386,8 +491,8 @@ mod test {
             .insert_implicit("host".into(), "74794bfb6795".into());
 
         assert_eq!(
-            expected,
-            event_from_str(&"host".to_string(), None, raw).unwrap()
+            event_from_str(&"host".to_string(), None, raw, false).unwrap(),
+            expected
         );
     }
 }

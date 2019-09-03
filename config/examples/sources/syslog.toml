@@ -6,6 +6,11 @@
 [sources.my_syslog_source]
   # REQUIRED - General
   type = "syslog" # must be: syslog
+  emit_structured = true # no default, set to `false` for less traffic
+  # in case of `json` encoding being used in downstream sinks
+  # structured data will be represented as json fields;
+  # in case of `text` encoding being used in downstream sinks
+  # only message itself will be emitted
 
   # OPTIONAL - General
   address = "0.0.0.0:9000" # no default

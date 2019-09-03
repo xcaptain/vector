@@ -1,5 +1,6 @@
 use crate::Event;
 use futures::{future, stream, sync::mpsc, try_ready, Async, Future, Poll, Sink, Stream};
+use std::collections::HashMap;
 use std::mem;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -82,6 +83,16 @@ pub fn random_string(len: usize) -> String {
 
 pub fn random_lines(len: usize) -> impl Iterator<Item = String> {
     std::iter::repeat(()).map(move |_| random_string(len))
+}
+
+pub fn random_map(size: usize, field_len: usize) -> HashMap<String, String> {
+    (0..size)
+        .map(move |_| (random_string(field_len), random_string(field_len)))
+        .collect()
+}
+
+pub fn random_maps(size: usize, field_len: usize) -> impl Iterator<Item = HashMap<String, String>> {
+    std::iter::repeat(()).map(move |_| random_map(size, field_len))
 }
 
 pub fn collect_n<T>(mut rx: mpsc::Receiver<T>, n: usize) -> impl Future<Item = Vec<T>, Error = ()> {
