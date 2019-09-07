@@ -1,6 +1,9 @@
 use crate::Event;
 use futures::{future, stream, sync::mpsc, try_ready, Async, Future, Poll, Sink, Stream};
+use rand::distributions::Alphanumeric;
+use rand::{thread_rng, Rng};
 use std::collections::HashMap;
+use std::iter;
 use std::mem;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -72,9 +75,6 @@ pub fn random_events_with_stream(
 }
 
 pub fn random_string(len: usize) -> String {
-    use rand::distributions::Alphanumeric;
-    use rand::{thread_rng, Rng};
-
     thread_rng()
         .sample_iter(&Alphanumeric)
         .take(len)
@@ -85,14 +85,19 @@ pub fn random_lines(len: usize) -> impl Iterator<Item = String> {
     std::iter::repeat(()).map(move |_| random_string(len))
 }
 
-pub fn random_map(size: usize, field_len: usize) -> HashMap<String, String> {
+pub fn random_map(max_size: usize, field_len: usize) -> HashMap<String, String> {
+    let size = thread_rng().gen_range(0, max_size);
+
     (0..size)
         .map(move |_| (random_string(field_len), random_string(field_len)))
         .collect()
 }
 
-pub fn random_maps(size: usize, field_len: usize) -> impl Iterator<Item = HashMap<String, String>> {
-    std::iter::repeat(()).map(move |_| random_map(size, field_len))
+pub fn random_maps(
+    max_size: usize,
+    field_len: usize,
+) -> impl Iterator<Item = HashMap<String, String>> {
+    iter::repeat(()).map(move |_| random_map(max_size, field_len))
 }
 
 pub fn collect_n<T>(mut rx: mpsc::Receiver<T>, n: usize) -> impl Future<Item = Vec<T>, Error = ()> {

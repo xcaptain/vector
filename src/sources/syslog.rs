@@ -28,7 +28,6 @@ pub struct SyslogConfig {
     #[serde(default = "default_max_length")]
     pub max_length: usize,
     pub host_key: Option<String>,
-    pub emit_structured: bool,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, is_enum_variant)]
@@ -44,12 +43,11 @@ fn default_max_length() -> usize {
 }
 
 impl SyslogConfig {
-    pub fn new(mode: Mode, emit_structured: bool) -> Self {
+    pub fn new(mode: Mode) -> Self {
         Self {
             mode,
             host_key: None,
             max_length: default_max_length(),
-            emit_structured,
         }
     }
 }
@@ -69,25 +67,12 @@ impl SourceConfig for SyslogConfig {
                 let source = SyslogTcpSource {
                     max_length: self.max_length,
                     host_key,
-                    emit_structured: self.emit_structured,
                 };
                 let shutdown_secs = 30;
                 source.run(address, shutdown_secs, out)
             }
-            Mode::Udp { address } => Ok(udp(
-                address,
-                self.max_length,
-                host_key,
-                self.emit_structured,
-                out,
-            )),
-            Mode::Unix { path } => Ok(unix(
-                path,
-                self.max_length,
-                host_key,
-                self.emit_structured,
-                out,
-            )),
+            Mode::Udp { address } => Ok(udp(address, self.max_length, host_key, out)),
+            Mode::Unix { path } => Ok(unix(path, self.max_length, host_key, out)),
         }
     }
 
@@ -100,7 +85,6 @@ impl SourceConfig for SyslogConfig {
 struct SyslogTcpSource {
     max_length: usize,
     host_key: String,
-    emit_structured: bool,
 }
 
 impl TcpSource for SyslogTcpSource {
@@ -111,7 +95,7 @@ impl TcpSource for SyslogTcpSource {
     }
 
     fn build_event(&self, frame: String, host: Option<Bytes>) -> Option<Event> {
-        event_from_str(&self.host_key, host, frame, self.emit_structured).map(|event| {
+        event_from_str(&self.host_key, host, frame).map(|event| {
             trace!(
                 message = "Received one event.",
                 event = field::debug(&event)
@@ -126,7 +110,6 @@ pub fn udp(
     addr: SocketAddr,
     _max_length: usize,
     host_key: String,
-    emit_structured: bool,
     out: mpsc::Sender<Event>,
 ) -> super::Source {
     let out = out.sink_map_err(|e| error!("error sending line: {:?}", e));
@@ -149,7 +132,7 @@ pub fn udp(
             let lines_in = UdpFramed::new(socket, BytesCodec::new())
                 .filter_map(move |(bytes, addr)| {
                     let host_key = host_key.clone();
-                    event_from_bytes(&host_key, emit_structured, &bytes).map(|mut e| {
+                    event_from_bytes(&host_key, &bytes).map(|mut e| {
                         e.as_mut_log()
                             .insert_implicit(host_key.into(), addr.to_string().into());
                         e
@@ -166,7 +149,6 @@ pub fn unix(
     path: PathBuf,
     max_length: usize,
     host_key: String,
-    emit_structured: bool,
     out: mpsc::Sender<Event>,
 ) -> super::Source {
     let out = out.sink_map_err(|e| error!("error sending line: {:?}", e));
@@ -198,9 +180,7 @@ pub fn unix(
 
                 let host_key2 = host_key.clone();
                 let lines_in = FramedRead::new(socket, LinesCodec::new_with_max_length(max_length))
-                    .filter_map(move |event| {
-                        event_from_str(&host_key.clone(), None, event, emit_structured)
-                    })
+                    .filter_map(move |event| event_from_str(&host_key.clone(), None, event))
                     .map(move |mut e| {
                         if let Some(path) = &path {
                             e.as_mut_log().insert_implicit(
@@ -219,10 +199,10 @@ pub fn unix(
     }))
 }
 
-fn event_from_bytes(host_key: &String, emit_structured: bool, bytes: &[u8]) -> Option<Event> {
+fn event_from_bytes(host_key: &String, bytes: &[u8]) -> Option<Event> {
     std::str::from_utf8(bytes)
         .ok()
-        .and_then(|s| event_from_str(host_key, None, s, emit_structured))
+        .and_then(|s| event_from_str(host_key, None, s))
 }
 
 // TODO: many more cases to handle:
@@ -231,12 +211,7 @@ fn event_from_bytes(host_key: &String, emit_structured: bool, bytes: &[u8]) -> O
 // octet framing (i.e. num bytes as ascii string prefix) with and without delimiters
 // null byte delimiter in place of newline
 
-fn event_from_str(
-    host_key: &String,
-    host: Option<Bytes>,
-    raw: impl AsRef<str>,
-    emit_structured: bool,
-) -> Option<Event> {
+fn event_from_str(host_key: &String, host: Option<Bytes>, raw: impl AsRef<str>) -> Option<Event> {
     let line = raw.as_ref();
     trace!(
         message = "Received line.",
@@ -246,11 +221,7 @@ fn event_from_str(
     let line = line.trim();
     syslog_rfc5424::parse_message(line)
         .map(|parsed| {
-            let mut event = if emit_structured {
-                Event::from(&parsed.msg[..])
-            } else {
-                Event::from(line)
-            };
+            let mut event = Event::from(&parsed.msg[..]);
 
             if let Some(host) = &parsed.hostname {
                 event
@@ -270,9 +241,7 @@ fn event_from_str(
                 .as_mut_log()
                 .insert_implicit(event::TIMESTAMP.clone(), timestamp.into());
 
-            if emit_structured {
-                insert_fields_from_rfc5424(&mut event, parsed);
-            }
+            insert_fields_from_rfc5424(&mut event, parsed);
 
             trace!(
                 message = "processing one event.",
@@ -309,7 +278,7 @@ fn insert_fields_from_rfc5424(event: &mut Event, parsed: SyslogMessage) {
     for (id, data) in parsed.sd.iter() {
         for (name, value) in data.iter() {
             let key = format!("{}.{}", id, name);
-            log.insert_implicit(key.into(), value.clone().into());
+            log.insert_explicit(key.into(), value.clone().into());
         }
     }
 }
@@ -326,7 +295,6 @@ mod test {
             r#"
             mode = "tcp"
             address = "127.0.0.1:1235"
-            emit_structured = true
           "#,
         )
         .unwrap();
@@ -337,7 +305,6 @@ mod test {
             mode = "udp"
             address = "127.0.0.1:1235"
             max_length = 32187
-            emit_structured = false
           "#,
         )
         .unwrap();
@@ -347,7 +314,6 @@ mod test {
             r#"
             mode = "unix"
             path = "127.0.0.1:1235"
-            emit_structured = false
           "#,
         )
         .unwrap();
@@ -357,31 +323,11 @@ mod test {
     #[test]
     fn syslog_ng_network_syslog_protocol() {
         // this should also match rsyslog omfwd with template=RSYSLOG_SyslogProtocol23Format
-        let raw = r#"<13>1 2019-02-13T19:48:34+00:00 74794bfb6795 root 8449 - [meta sequenceId="1"] i am foobar"#;
-
-        let mut expected = Event::from(raw);
-        expected.as_mut_log().insert_implicit(
-            event::TIMESTAMP.clone(),
-            chrono::Utc.ymd(2019, 2, 13).and_hms(19, 48, 34).into(),
-        );
-        expected
-            .as_mut_log()
-            .insert_implicit("host".into(), "74794bfb6795".into());
-
-        assert_eq!(
-            event_from_str(&"host".to_string(), None, raw, false).unwrap(),
-            expected
-        );
-    }
-
-    #[test]
-    fn syslog_ng_network_syslog_protocol_structured() {
-        // this should also match rsyslog omfwd with template=RSYSLOG_SyslogProtocol23Format
         let msg = "i am foobar";
         let raw = format!(
             r#"<13>1 2019-02-13T19:48:34+00:00 74794bfb6795 root 8449 - {}{} {}"#,
-            r#"[meta1 seqId="1" someKey="someValue"]"#,
-            r#"[meta2 seqId="2" anotherKey="anotherValue"]"#,
+            r#"[meta sequenceId="1" sysUpTime="37" language="EN"]"#,
+            r#"[origin ip="192.168.0.1" software="test"]"#,
             msg
         );
 
@@ -395,10 +341,11 @@ mod test {
             );
             expected.insert_implicit("host".into(), "74794bfb6795".into());
 
-            expected.insert_implicit("meta1.seqId".into(), "1".into());
-            expected.insert_implicit("meta2.seqId".into(), "2".into());
-            expected.insert_implicit("meta1.someKey".into(), "someValue".into());
-            expected.insert_implicit("meta2.anotherKey".into(), "anotherValue".into());
+            expected.insert_explicit("meta.sequenceId".into(), "1".into());
+            expected.insert_explicit("meta.sysUpTime".into(), "37".into());
+            expected.insert_explicit("meta.language".into(), "EN".into());
+            expected.insert_explicit("origin.software".into(), "test".into());
+            expected.insert_explicit("origin.ip".into(), "192.168.0.1".into());
 
             expected.insert_implicit("severity".into(), "notice".into());
             expected.insert_implicit("facility".into(), "user".into());
@@ -408,9 +355,71 @@ mod test {
         }
 
         assert_eq!(
-            event_from_str(&"host".to_string(), None, raw, true).unwrap(),
+            event_from_str(&"host".to_string(), None, raw).unwrap(),
             expected
         );
+    }
+
+    #[test]
+    fn handles_incorrect_sd_element() {
+        let msg = format!(
+            r#"<13>1 2019-02-13T19:48:34+00:00 74794bfb6795 root 8449 - {} qwerty"#,
+            r#"[incorrect x]"#
+        );
+
+        let event = event_from_str(&"host".to_string(), None, msg);
+        assert_eq!(event, None);
+
+        let msg = format!(
+            r#"<13>1 2019-02-13T19:48:34+00:00 74794bfb6795 root 8449 - {} qwerty"#,
+            r#"[incorrect x=]"#
+        );
+
+        let event = event_from_str(&"host".to_string(), None, msg);
+        assert_eq!(event, None);
+    }
+
+    #[test]
+    fn handles_empty_sd_element() {
+        fn there_is_map_called_empty(event: Event) -> bool {
+            event
+                .as_log()
+                .all_fields()
+                .find(|(key, _)| (&key[..]).starts_with("empty"))
+                == None
+        }
+
+        let msg = format!(
+            r#"<13>1 2019-02-13T19:48:34+00:00 74794bfb6795 root 8449 - {} qwerty"#,
+            r#"[empty]"#
+        );
+
+        let event = event_from_str(&"host".to_string(), None, msg).unwrap();
+        assert!(there_is_map_called_empty(event));
+
+        let msg = format!(
+            r#"<13>1 2019-02-13T19:48:34+00:00 74794bfb6795 root 8449 - {} qwerty"#,
+            r#"[non_empty x="1"][empty]"#
+        );
+
+        let event = event_from_str(&"host".to_string(), None, msg).unwrap();
+        assert!(there_is_map_called_empty(event));
+
+        let msg = format!(
+            r#"<13>1 2019-02-13T19:48:34+00:00 74794bfb6795 root 8449 - {} qwerty"#,
+            r#"[empty][non_empty x="1"]"#
+        );
+
+        let event = event_from_str(&"host".to_string(), None, msg).unwrap();
+        assert!(there_is_map_called_empty(event));
+
+        let msg = format!(
+            r#"<13>1 2019-02-13T19:48:34+00:00 74794bfb6795 root 8449 - {} qwerty"#,
+            r#"[empty not_really="testing the test"]"#
+        );
+
+        let event = event_from_str(&"host".to_string(), None, msg).unwrap();
+        assert!(!there_is_map_called_empty(event));
     }
 
     #[test]
@@ -421,18 +430,9 @@ mod test {
             "#;
         let cleaned = r#"<13>1 2019-02-13T19:48:34+00:00 74794bfb6795 root 8449 - [meta sequenceId="1"] i am foobar"#;
 
-        let mut expected = Event::from(cleaned);
-        expected.as_mut_log().insert_implicit(
-            event::TIMESTAMP.clone(),
-            chrono::Utc.ymd(2019, 2, 13).and_hms(19, 48, 34).into(),
-        );
-        expected
-            .as_mut_log()
-            .insert_implicit("host".into(), "74794bfb6795".into());
-
         assert_eq!(
-            event_from_str(&"host".to_string(), None, raw, false).unwrap(),
-            expected
+            event_from_str(&"host".to_string(), None, raw).unwrap(),
+            event_from_str(&"host".to_string(), None, cleaned).unwrap()
         );
     }
 
@@ -451,7 +451,7 @@ mod test {
             .insert_implicit("host".into(), "74794bfb6795".into());
 
         assert_eq!(
-            event_from_str(&"host".to_string(), None, raw, false).unwrap(),
+            event_from_str(&"host".to_string(), None, raw).unwrap(),
             expected
         );
     }
@@ -471,7 +471,7 @@ mod test {
             .insert_implicit("host".into(), "74794bfb6795".into());
 
         assert_eq!(
-            event_from_str(&"host".to_string(), None, raw, false).unwrap(),
+            event_from_str(&"host".to_string(), None, raw).unwrap(),
             expected
         );
     }
@@ -491,7 +491,7 @@ mod test {
             .insert_implicit("host".into(), "74794bfb6795".into());
 
         assert_eq!(
-            event_from_str(&"host".to_string(), None, raw, false).unwrap(),
+            event_from_str(&"host".to_string(), None, raw).unwrap(),
             expected
         );
     }
